@@ -1,11 +1,10 @@
 import numpy as np
-import h5py
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import signal
 from scipy.optimize import curve_fit
-from scipy.integrate import trapz
+from scipy.integrate import trapezoid
 
 # -------------------------- 论文固定参数配置 --------------------------
 # ICESat-2 系统参数
@@ -26,30 +25,34 @@ slope_depth_range = [3, 10]  # 斜率法计算深度范围 (m)
 
 # -------------------------- 核心工具函数 --------------------------
 def read_atl03_data(atl03_path):
-    """读取ICESat-2 ATL03数据（HDF5格式），提取强光束夜间数据"""
-    with h5py.File(atl03_path, 'r') as f:
-        # 提取强光束数据（GT1L/GT2L/GT3L的强光束）
-        beam = 'gt1l'  # 可切换为gt2l/gt3l
-        photon_data = f[f'{beam}/heights']
-        
-        # 筛选条件：质量flag=0（标称光子）、置信度≥4、夜间数据（solar_elevation<0）
-        quality_ph = photon_data['quality_ph'][:]
-        confidence = photon_data['signal_confidence'][:]
-        solar_elevation = photon_data['solar_elevation'][:]
-        valid_idx = (quality_ph == 0) & (confidence >= 4) & (solar_elevation < 0)
-        
-        # 提取核心数据
-        lat = photon_data['lat'][:][valid_idx]
-        lon = photon_data['lon'][:][valid_idx]
-        height = photon_data['h_elv'][:][valid_idx]  # 椭球高度 (m)
-        along_track = photon_data['along_track_distance'][:][valid_idx]  # 沿轨距离 (m)
-        
+    """读取ICESat-2 ATL03数据（TXT格式），提取预处理数据"""
+    # 读取TXT文件的辅助函数
+    def read_txt_file(file_path):
+        values = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                # 文件格式：每行一个数值
+                value = line.strip()
+                if value:
+                    values.append(float(value))
+        return np.array(values)
+    
+    # 数据文件路径
+    base_path = r'd:\workspace\PycharmProjects\a\a\yelvsu\yelvsu\1007'
+    
+    # 读取各数据文件
+    lon = read_txt_file(base_path + '\\1selected_lon.txt')
+    lat = read_txt_file(base_path + '\\1selected_lat.txt')
+    height = read_txt_file(base_path + '\\1selected_height.txt')
+    along_track = read_txt_file(base_path + '\\1selected_distance_along.txt')
+    
+    # 返回DataFrame
     return pd.DataFrame({
         'lat': lat, 'lon': lon, 'height': height, 'along_track': along_track
     })
 
 def get_sea_surface(df):
-    """确定海平面高程（论文：置信度4的光子高斯拟合）"""
+    """确定海平面高程（直方图峰值法）"""
     delta_h = 0.1
     heights = df['height'].values
     min_h, max_h = heights.min(), heights.max()
@@ -152,7 +155,7 @@ def klett_method(S, depth, alpha_zm, zm):
     # 计算积分项 ∫RCS(z)dz
     integral_RCS = np.zeros(n_depth)
     for i in range(n_depth):
-        integral_RCS[i] = trapz(RCS[:i+1], depth[:i+1])
+        integral_RCS[i] = trapezoid(RCS[:i+1], depth[:i+1])
     
     # 分深度段计算α(z)（Kd≈α(z)）
     zm_idx = np.argmin(np.abs(depth - zm))
@@ -253,9 +256,9 @@ def validate_results(retrieved, observed, param_name):
 # -------------------------- 主流程执行 --------------------------
 if __name__ == '__main__':
     # 1. 数据输入（替换为实际文件路径）
-    atl03_path = "ATL03_20201011202918_02700902_006_01.h5"  # ICESat-2 ATL03数据
+    atl03_path = ""  # ICESat-2 ATL03数据路径（不再使用）
     modis_path = "MODIS_monthly_Kd_bbp.csv"  # MODIS月均数据（含Kd490、bbp443）
-    wind_path = "MERRA2_wind.csv"  # MERRA-2风速数据（沿轨匹配）
+    wind_path = r'd:\workspace\PycharmProjects\a\a\yelvsu\yelvsu\1007\wind.txt'  # 风速数据（TXT格式）
     
     # 2. 数据读取与预处理
     print("步骤1：读取并预处理ICESat-2数据...")
@@ -271,44 +274,129 @@ if __name__ == '__main__':
     Kd_matrix = retrieve_Kd(S, depth)
     
     print("步骤4：反演颗粒后向散射系数bbp...")
-    wind_data = pd.read_csv(wind_path)['wind_speed'].values  # 沿轨风速
+    # 读取风速数据（TXT格式：每行一个数值）
+    def read_wind_txt(file_path):
+        values = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                value = line.strip()
+                if value:
+                    values.append(float(value))
+        return np.array(values)
+    wind_data = read_wind_txt(wind_path)  # 沿轨风速
     bbp_matrix = retrieve_bbp(S, Kd_matrix, depth, wind_data)
     
-    # 5. 与MODIS数据验证
-    print("步骤5：结果验证...")
-    modis_df = pd.read_csv(modis_path)
-    modis_Kd532 = wavelength_conversion(modis_df['Kd490'].values, 490, param_type='Kd')
-    modis_bbp532 = wavelength_conversion(modis_df['bbp443'].values, 443, param_type='bbp')
+    # 5. 结果可视化（论文图2、3风格）
+    print("步骤5：结果可视化...")
     
-    # 匹配沿轨位置
-    valid_modis_idx = np.interp(along_km, modis_df['along_km'].values, np.arange(len(modis_df)))
-    valid_modis_idx = valid_modis_idx.astype(int)
+    # 5.1 生成热力图（深度-沿轨分布）并直接显示
+    print("显示热力图（深度-沿轨分布）...")
+    fig1, axes1 = plt.subplots(2, 1, figsize=(12, 10))
     
-    Kd_validate = validate_results(Kd_matrix[:, :len(valid_modis_idx)], 
-                                  modis_Kd532[valid_modis_idx], 'Kd')
-    bbp_validate = validate_results(bbp_matrix[:, :len(valid_modis_idx)], 
-                                   modis_bbp532[valid_modis_idx], 'bbp')
-    
-    print(f"Kd验证结果：R²={Kd_validate['R²']}, RMSE={Kd_validate['RMSE']}")
-    print(f"bbp验证结果：R²={bbp_validate['R²']}, RMSE={bbp_validate['RMSE']}")
-    
-    # 6. 结果可视化（论文图2、3风格）
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
-    
-    # 6.1 Kd垂直-水平分布热力图
-    sns.heatmap(Kd_matrix, ax=axes[0], cmap='jet', vmin=0, vmax=0.4,
+    # Kd垂直-水平分布热力图
+    sns.heatmap(Kd_matrix, ax=axes1[0], cmap='jet', vmin=0, vmax=0.4,
                 xticklabels=np.round(along_km, 1), yticklabels=np.round(depth, 1))
-    axes[0].set_title(f'Kd Distribution (R²={Kd_validate["R²"]}, RMSE={Kd_validate["RMSE"]})', fontsize=12)
-    axes[0].set_xlabel('Along-Track Distance (km)')
-    axes[0].set_ylabel('Depth (m)')
+    axes1[0].set_title('Kd Distribution', fontsize=12)
+    axes1[0].set_xlabel('Along-Track Distance (km)')
+    axes1[0].set_ylabel('Depth (m)')
     
-    # 6.2 bbp垂直-水平分布热力图（对数尺度）
-    sns.heatmap(np.log10(bbp_matrix + 1e-6), ax=axes[1], cmap='jet', vmin=-3, vmax=-1,
+    # bbp垂直-水平分布热力图（对数尺度）
+    sns.heatmap(np.log10(bbp_matrix + 1e-6), ax=axes1[1], cmap='jet', vmin=-3, vmax=-1,
                 xticklabels=np.round(along_km, 1), yticklabels=np.round(depth, 1))
-    axes[1].set_title(f'bbp Distribution (log10) (R²={bbp_validate["R²"]}, RMSE={bbp_validate["RMSE"]})', fontsize=12)
-    axes[1].set_xlabel('Along-Track Distance (km)')
-    axes[1].set_ylabel('Depth (m)')
+    axes1[1].set_title('bbp Distribution (log10)', fontsize=12)
+    axes1[1].set_xlabel('Along-Track Distance (km)')
+    axes1[1].set_ylabel('Depth (m)')
     
     plt.tight_layout()
-    plt.savefig('ICESat2_retrieval_results.png', dpi=300, bbox_inches='tight')
-    print("结果图已保存为 ICESat2_retrieval_results.png")
+    plt.show(block=False)  # 非阻塞显示热力图
+    
+    # 5.2 生成时间序列对比图（ICESat2）并直接显示
+    print("显示时间序列图（沿轨分布）...")
+    # 尝试使用不同的数据处理方式，避免无效值问题
+    try:
+        # 使用表面层数据（深度较浅的部分）来计算沿轨平均
+        surface_depth_idx = np.where(depth <= 5)[0]  # 使用5m以内的表层数据
+        
+        if len(surface_depth_idx) > 0:
+            # 提取表层数据
+            surface_Kd = Kd_matrix[surface_depth_idx, :]
+            surface_bbp = bbp_matrix[surface_depth_idx, :]
+            
+            # 沿轨平均（只计算有效值）
+            avg_Kd = np.zeros(surface_Kd.shape[1])
+            avg_bbp = np.zeros(surface_bbp.shape[1])
+            
+            for i in range(surface_Kd.shape[1]):
+                # 计算每个沿轨位置的有效平均值
+                valid_Kd = surface_Kd[:, i][np.isfinite(surface_Kd[:, i])]
+                valid_bbp = surface_bbp[:, i][np.isfinite(surface_bbp[:, i])]
+                
+                avg_Kd[i] = np.mean(valid_Kd) if len(valid_Kd) > 0 else np.nan
+                avg_bbp[i] = np.mean(valid_bbp) if len(valid_bbp) > 0 else np.nan
+            
+            # 过滤掉无效值
+            valid_idx = np.isfinite(avg_Kd) & np.isfinite(avg_bbp) & (avg_bbp > 0)
+            
+            if np.sum(valid_idx) > 5:  # 确保有足够的数据点
+                fig2, axes2 = plt.subplots(2, 1, figsize=(10, 8))
+                
+                # Kd时间序列图
+                axes2[0].plot(along_km[valid_idx], avg_Kd[valid_idx], 'o-', color='blue', label='ICESat2')
+                axes2[0].set_title('Kd Along-Track Distribution', fontsize=12)
+                axes2[0].set_xlabel('Along-Track Distance (km)')
+                axes2[0].set_ylabel('Kd (m⁻¹)')
+                axes2[0].set_ylim(0, 0.4)
+                axes2[0].legend()
+                
+                # bbp时间序列图（对数尺度，使用较小的范围）
+                axes2[1].plot(along_km[valid_idx], avg_bbp[valid_idx], 'o-', color='blue', label='ICESat2')
+                axes2[1].set_title('bbp Along-Track Distribution', fontsize=12)
+                axes2[1].set_xlabel('Along-Track Distance (km)')
+                axes2[1].set_ylabel('bbp (m⁻¹)')
+                axes2[1].set_ylim(1e-3, 1e-1)  # 设置合理的y轴范围
+                axes2[1].set_yscale('log')
+                axes2[1].legend()
+                
+                plt.tight_layout()
+                plt.show()  # 显示时间序列图，阻塞等待用户关闭
+            else:
+                print("有效数据点不足，无法生成时间序列图")
+        else:
+            print("没有找到足够的表层数据")
+    except Exception as e:
+        print(f"生成时间序列图时出错: {e}")
+        # 如果出错，使用简化版本的时间序列图
+        try:
+            print("尝试使用简化版本的时间序列图...")
+            fig2, axes2 = plt.subplots(2, 1, figsize=(10, 8))
+            
+            # 只使用第一个深度层的数据
+            if Kd_matrix.shape[0] > 0:
+                # Kd时间序列图（使用第一个深度层）
+                kd_first_depth = Kd_matrix[0, :]
+                valid_kd_idx = np.isfinite(kd_first_depth)
+                if np.sum(valid_kd_idx) > 0:
+                    axes2[0].plot(along_km[valid_kd_idx], kd_first_depth[valid_kd_idx], 'o-', color='blue', label='ICESat2')
+                axes2[0].set_title('Kd Along-Track Distribution (First Depth Layer)', fontsize=12)
+                axes2[0].set_xlabel('Along-Track Distance (km)')
+                axes2[0].set_ylabel('Kd (m⁻¹)')
+                axes2[0].set_ylim(0, 0.4)
+                axes2[0].legend()
+            
+            # bbp时间序列图（使用第一个深度层）
+            if bbp_matrix.shape[0] > 0:
+                bbp_first_depth = bbp_matrix[0, :]
+                valid_bbp_idx = np.isfinite(bbp_first_depth) & (bbp_first_depth > 0)
+                if np.sum(valid_bbp_idx) > 0:
+                    axes2[1].plot(along_km[valid_bbp_idx], bbp_first_depth[valid_bbp_idx], 'o-', color='blue', label='ICESat2')
+                axes2[1].set_title('bbp Along-Track Distribution (First Depth Layer)', fontsize=12)
+                axes2[1].set_xlabel('Along-Track Distance (km)')
+                axes2[1].set_ylabel('bbp (m⁻¹)')
+                axes2[1].set_ylim(1e-3, 1e-1)
+                axes2[1].set_yscale('log')
+                axes2[1].legend()
+            
+            plt.tight_layout()
+            plt.show()
+        except Exception as e2:
+            print(f"简化版本时间序列图也生成失败: {e2}")

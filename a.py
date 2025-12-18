@@ -139,7 +139,7 @@ def get_chl(file):
     sita = 0.36 * 0.36
     R = 500000
 
-    data_dir = "../yelvsu/1024" + "/"
+    data_dir = "../yelvsu/yelvsu/1007" + "/"
     # data_dir = "../yelvsu/track-ma1" + "/"
     # data_dir = "2902120_185" + "/"
     # data_dir = "../yelvsu/0327_19_21" + "/"
@@ -338,6 +338,6 @@ def get_chl(file):
 
 
 if __name__ == '__main__':
-    out_file1 = "C:/Users\Zoliqin\Desktop/ar_ic/desert/a/1l/chla/data0.csv"
+    out_file1 = "C:/Users/Zoliqin/Desktop/ar_ic/desert/a/1l/chla/data0.csv"
     get_chl(out_file1)
     # get_huadong_chl(out_file1)
