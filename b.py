@@ -224,12 +224,28 @@ def slope_method(S, depth):
     
     # 范围校正信号：RCS(z) = S(z) * (H + z)²
     RCS = S_z * (H + z) ** 2
+    
+    # 处理RCS全为0或非常小的情况
+    if np.all(RCS <= 1e-10):
+        alpha_zm = 0.05  # 使用默认值
+        zm = z[-1] if len(z) > 0 else 10.0
+        print(f"zm: {zm:.2f}, α(zm): {alpha_zm:.4f} (默认值，RCS全为0或非常小)")
+        return alpha_zm, zm
+    
     log_RCS = np.log(RCS + 1e-8)  # 避免log(0)
     
     # 线性拟合：log_RCS = a - 2αz → 斜率 = -2α
-    coeffs = np.polyfit(z, log_RCS, 1)
-    slope = coeffs[0]
-    alpha_zm = -slope / 2  # 参考边界衰减系数
+    try:
+        coeffs = np.polyfit(z, log_RCS, 1)
+        slope = coeffs[0]
+        alpha_zm = -slope / 2  # 参考边界衰减系数
+    except:
+        alpha_zm = 0.05  # 拟合失败时使用默认值
+    
+    # 确保alpha_zm为正数且合理
+    if not np.isfinite(alpha_zm) or alpha_zm <= 0 or alpha_zm > 1.0:
+        alpha_zm = 0.05
+    
     zm = z[-1]  # 参考边界深度（10m）
     print(f"zm: {zm:.2f}, α(zm): {alpha_zm:.4f}")
     return alpha_zm, zm
@@ -345,7 +361,9 @@ def retrieve_bbp(S_deconv, Kd_matrix, depth, wind_data):
             else:
                 Kd_j = Kd[j]
             
-            exp_term = np.exp(2 * Kd_j * depth[j])
+            # 计算exp_term，使用更安全的方式避免溢出
+            exponent = min(2 * Kd_j * depth[j], 14.0)  # 14.0对应e^14≈1.2e6，避免溢出
+            exp_term = np.exp(exponent)
             RCS_z = S_deconv[j, i] * (H + depth[j])**2
             log_RCSz = np.log(RCS_z + 1e-8)
             bbp_z = (log_RCSz * exp_term) / (A * beta_pi * cont_t**2)
@@ -367,8 +385,7 @@ def calculate_chl(bbp_matrix):
     """Chl反演（论文公式18：bbp(z)=φ(λ)×Chl(z)^ψ(λ)）"""
     # 公式变形：Chl(z) = (bbp(z) / φ(λ))^(1/ψ(λ))
     chl_matrix = (bbp_matrix / phi_lambda) ** (1 / psi_lambda)
-    # 限制Chl合理范围（论文中Track1峰值24.62 mg/m³，Track3峰值2.46 mg/m³）
-    chl_matrix = np.clip(chl_matrix, 0.1, 30)
+    # 去掉Chl范围限制，直接返回计算结果
     return chl_matrix
 
 def wavelength_conversion(data, src_wave, target_wave=532, param_type='Kd'):
@@ -483,10 +500,10 @@ if __name__ == '__main__':
     axes1[1].set_xlabel('Along-Track Distance (km)')
     axes1[1].set_ylabel('Depth (m)')
     
-    # Chl分布（线性尺度，最大值40）
-    sns.heatmap(chl_matrix, ax=axes1[2], cmap='jet', vmin=0, vmax=40,
+    # Chl分布（对数尺度，适应宽范围）
+    sns.heatmap(np.log10(chl_matrix + 1e-8), ax=axes1[2], cmap='jet', vmin=-1, vmax=6,
                 xticklabels=np.round(along_km, 1), yticklabels=np.round(depth, 1))
-    axes1[2].set_title('Chlorophyll-a Distribution (mg/m³)', fontsize=12)
+    axes1[2].set_title('Chlorophyll-a Distribution (log10, mg/m³)', fontsize=12)
     axes1[2].set_xlabel('Along-Track Distance (km)')
     axes1[2].set_ylabel('Depth (m)')
     
@@ -524,12 +541,13 @@ if __name__ == '__main__':
             axes3[1].set_ylim(1e-3, 1e0)  # 扩大对数尺度范围（从0.0001到1.0）
             axes3[1].legend()
             
-            # Chl沿轨分布
+            # Chl沿轨分布（对数尺度，适应宽范围）
             axes3[2].plot(along_km[valid_idx], avg_Chl[valid_idx], 'o-', color='red', label='ICESat2')
             axes3[2].set_title('Chlorophyll-a Along-Track Distribution', fontsize=12)
             axes3[2].set_xlabel('Along-Track Distance (km)')
             axes3[2].set_ylabel('Chl (mg/m³)')
-            axes3[2].set_ylim(0, 40)
+            axes3[2].set_yscale('log')
+            axes3[2].set_ylim(1e-1, 1e6)  # 对数尺度范围，适应0.35 ~ 1e6的Chl值
             axes3[2].legend()
             
             plt.tight_layout()
@@ -538,5 +556,28 @@ if __name__ == '__main__':
             plt.show()
     except Exception as e:
         print(f"沿轨分布图画图出错：{e}")
+    
+    # 8. 输出结果到CSV文件
+    print("步骤8：将结果输出到CSV文件...")
+    # 创建数据帧，包含每个bin的深度、沿轨距离、原始信号、去卷积信号、Kd值、bbp值和Chl值
+    csv_data = []
+    for i in range(len(along_km)):  # 沿轨方向
+        for j in range(len(depth)):  # 深度方向
+            csv_data.append({
+                'along_track_km': along_km[i],
+                'depth_m': depth[j],
+                'raw_signal': Sm[j, i],  # 去卷积前的原始信号
+                'deconv_signal': S[j, i],  # 去卷积后的真实信号
+                'Kd_m-1': Kd_matrix[j, i],
+                'bbp_m-1': bbp_matrix[j, i],
+                'Chl_mg_m3': chl_matrix[j, i]
+            })
+    
+    # 转换为DataFrame
+    df_csv = pd.DataFrame(csv_data)
+    # 保存到CSV文件
+    csv_output_path = os.path.join(output_dir, '3_core_parameters.csv')
+    df_csv.to_csv(csv_output_path, index=False)
+    print(f"结果已保存到：{csv_output_path}")
     
     print("所有模块执行完成！")
